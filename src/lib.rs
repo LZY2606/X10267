@@ -81,6 +81,11 @@ struct State {
 
     wildcard: Wildcard,
     globstar: Wildcard,
+    /// Set while a segment-bounded `**/` is active in this state (including
+    /// inside a taken brace branch, since branches match on cloned state).
+    /// Used only by prefix matching to accept a directory at a boundary that
+    /// a globstar may cover with zero further segments.
+    seg_globstar: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -150,7 +155,42 @@ impl std::error::Error for Error {}
 /// exact behavior may change between releases. Callers accepting user-written
 /// patterns should reject invalid ones up front with [`validate`].
 pub fn glob_match(glob: impl AsRef<[u8]>, path: impl AsRef<[u8]>) -> bool {
-    let (matched, invalid_pattern) = glob_match_internal(glob.as_ref(), path.as_ref());
+    let (matched, invalid_pattern) = glob_match_core::<false, false>(glob.as_ref(), path.as_ref());
+    matched && !invalid_pattern
+}
+
+/// Splits leading `!` negation markers off a pattern, returning the number of
+/// leading markers. The traversal engine compiles patterns once and needs the
+/// same negation semantics [`glob_match`] applies.
+pub(crate) fn negation_markers(glob: &[u8]) -> usize {
+    glob.iter().take_while(|&&c| c == b'!').count()
+}
+
+/// Full match against an already-split pattern body, honoring the same
+/// validity gate as [`glob_match`]. Shared by the traversal engine so the
+/// walking path and the public matcher are one algorithm.
+pub(crate) fn match_body(body: &[u8], path: &[u8], case_sensitive: bool) -> bool {
+    let (matched, invalid_pattern) = if case_sensitive {
+        glob_match_core::<false, false>(body, path)
+    } else {
+        glob_match_core::<false, true>(body, path)
+    };
+    matched && !invalid_pattern
+}
+
+/// Prefix match: returns true when `path` (a directory) either matches the
+/// pattern body itself or can still contain a match in a descendant — i.e.
+/// every accepted path has `path` itself or `path/..` as a prefix. A `false`
+/// answer is exact: no descendant can match. `true` may be an
+/// over-approximation when a globstar is involved (the directory listing
+/// itself then narrows children), which only costs an extra descent, never a
+/// spurious result: file inclusion always goes through [`match_body`].
+pub(crate) fn body_can_have_descendant(body: &[u8], path: &[u8], case_sensitive: bool) -> bool {
+    let (matched, invalid_pattern) = if case_sensitive {
+        glob_match_core::<true, false>(body, path)
+    } else {
+        glob_match_core::<true, true>(body, path)
+    };
     matched && !invalid_pattern
 }
 
@@ -224,7 +264,10 @@ pub fn validate(glob: impl AsRef<[u8]>) -> Result<(), Error> {
 /// Returns the match result (with negation applied) alongside whether the
 /// pattern was detected as invalid, so tests can check the latter against
 /// [`validate`].
-fn glob_match_internal(glob: &[u8], path: &[u8]) -> (bool, bool) {
+fn glob_match_core<const PREFIX: bool, const IGNORE_CASE: bool>(
+    glob: &[u8],
+    path: &[u8],
+) -> (bool, bool) {
     let mut state = State::default();
 
     let mut negated = false;
@@ -237,7 +280,13 @@ fn glob_match_internal(glob: &[u8], path: &[u8]) -> (bool, bool) {
     let mut invalid_pattern = false;
     let match_start = state.glob_index;
     let matched =
-        state.glob_match_from(glob, path, match_start, &mut brace_stack, &mut invalid_pattern);
+        state.glob_match_from::<PREFIX, IGNORE_CASE>(
+            glob,
+            path,
+            match_start,
+            &mut brace_stack,
+            &mut invalid_pattern,
+        );
 
     // A negated glob matches every path its pattern does not — for an invalid
     // pattern that would be every path, even when the matcher never reaches
@@ -248,6 +297,11 @@ fn glob_match_internal(glob: &[u8], path: &[u8]) -> (bool, bool) {
     }
 
     (negated ^ matched, invalid_pattern)
+}
+
+#[cfg(test)]
+fn glob_match_internal(glob: &[u8], path: &[u8]) -> (bool, bool) {
+    glob_match_core::<false, false>(glob, path)
 }
 
 /// Returns the index just past the `]` closing the character class opened by
@@ -381,12 +435,21 @@ impl State {
         branch_state.glob_index = branch_index;
         branch_state.brace_depth = brace_stack.len();
 
-        let matched =
-            branch_state.glob_match_from(glob, path, branch_index, brace_stack, invalid_pattern);
-
         brace_stack.pop();
 
-        matched
+        // The branch's own `**` decisions do not leak back: the cloned state
+        // is consumed here, while `seg_globstar` on the parent survives when
+        // the branch itself set it via a globstar in the same state chain.
+        branch_state.glob_match_from::<PREFIX, IGNORE_CASE>(
+            glob,
+            path,
+            branch_index,
+            brace_stack,
+            invalid_pattern,
+        )
+        .tap(|_| {
+            brace_stack.pop();
+        })
     }
 
     fn match_brace(
