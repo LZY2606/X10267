@@ -154,6 +154,158 @@ pub fn glob_match(glob: impl AsRef<[u8]>, path: impl AsRef<[u8]>) -> bool {
     matched && !invalid_pattern
 }
 
+/// A single step in the deterministic explanation trace produced by
+/// [`glob_match_explain`].
+///
+/// Events are emitted in the exact order the matching engine makes the
+/// corresponding decisions, so a trace is fully determined by the `(glob,
+/// path)` pair: it does not depend on thread scheduling, call ordering, or
+/// any prior call. The engine holds no caches, counters, or other shared
+/// state between calls, so a failed call (e.g. one whose pattern is rejected
+/// by [`validate`]) cannot influence the trace of a later one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TraceEvent {
+    /// The pattern was checked by [`validate`] and accepted. This is the
+    /// "compile" step: `fast-glob` interprets patterns lazily with no
+    /// compilation pass, so validation is the only up-front analysis.
+    /// `negations` counts the leading `!` characters (the ignore polarity).
+    Compiled { negations: usize },
+    /// The pattern was rejected by [`validate`] with the same [`Error`]
+    /// stratification (`kind` + byte `index`) the public validator reports.
+    /// Matching still proceeds exactly as [`glob_match`] would — its result
+    /// for an invalid pattern is unspecified — so the trace continues after
+    /// this event and the verdict stays identical to [`glob_match`].
+    CompileError { kind: ErrorKind, index: usize },
+    /// Matching started at the beginning of the path (the "start directory"
+    /// of the match: all positions are byte offsets into `path`).
+    Start { path_len: usize },
+    /// A `*` or `**` wildcard was recorded as a backtracking point.
+    Wildcard { globstar: bool, glob_index: usize, path_index: usize },
+    /// A globstar skipped forward to just past a path separator, pruning the
+    /// intermediate segments from consideration at this position. `to` is
+    /// always greater than `from`, so even paths with arbitrarily repeated
+    /// segments (as a directory walker would produce when expanding a
+    /// symlink cycle) are consumed in a bounded number of steps — the
+    /// matcher never revisits a position it has pruned past.
+    SkipToSeparator { from: usize, to: usize },
+    /// Matching resumed at the most recent wildcard after a mismatch.
+    Backtrack { glob_index: usize, path_index: usize },
+    /// A `{a,b}` brace branch was tried.
+    BraceBranch { open: usize, branch: usize },
+    /// The remaining branches of a brace expansion were skipped.
+    BraceSkip { from: usize, to: usize },
+    /// A literal `/` in the pattern matched a path separator; `byte` is the
+    /// actual separator byte found in the path — `/`, or `\` on platforms
+    /// where [`std::path::is_separator`] accepts it. Case and separator
+    /// handling otherwise follow the same rules as [`glob_match`]: literal
+    /// bytes compare exactly.
+    Separator { path_index: usize, byte: u8 },
+    /// Matching stopped before consuming the whole path: no wildcard could
+    /// backtrack, so the remainder of the path was pruned. This is the
+    /// engine-level reason a path under a non-matching prefix is excluded
+    /// without being scanned further.
+    Pruned { glob_index: usize, path_index: usize },
+    /// Final verdict — always the last event of a trace.
+    Final { matched: bool, reason: FinalReason },
+}
+
+/// The reason a path was included or excluded, as recorded by the
+/// [`TraceEvent::Final`] event of an [`Explanation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FinalReason {
+    /// Pattern and path were fully consumed: the path is included because it
+    /// matched the pattern.
+    FullMatch,
+    /// The path did not match the pattern; the trace's [`TraceEvent::Pruned`]
+    /// events show where matching gave up.
+    NoMatch,
+    /// A negated (`!`-prefixed) pattern whose inner pattern did not match:
+    /// the path is included by the negation.
+    NegatedIncluded,
+    /// A negated (`!`-prefixed) pattern whose inner pattern matched: the
+    /// path is excluded — the ignore rule hit.
+    NegatedExcluded,
+    /// The pattern is invalid (see [`validate`]); the verdict is `false`
+    /// regardless of any partial match, exactly as [`glob_match`] behaves.
+    InvalidPattern,
+}
+
+/// The result of [`glob_match_explain`]: the verdict plus the deterministic
+/// trace of how it was reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explanation {
+    /// The verdict — always identical to [`glob_match`] for the same
+    /// `(glob, path)` pair, whether the pattern is valid or not.
+    pub matched: bool,
+    /// The ordered trace of decisions: pattern compilation, match start,
+    /// wildcard/globstar bookkeeping, segment pruning, brace branching,
+    /// separator handling, and the final verdict with its [`FinalReason`].
+    pub trace: Vec<TraceEvent>,
+}
+
+/// Performs glob pattern matching like [`glob_match`], additionally
+/// returning an [`Explanation`] of *why* the path was included or excluded.
+///
+/// This is an optional, opt-in mode: it shares the exact matching engine
+/// with [`glob_match`] (the instrumentation is generic over an internal
+/// trace sink and monomorphizes away on the default path, so [`glob_match`]
+/// keeps its performance), and `explanation.matched == glob_match(glob,
+/// path)` always holds — enabling explain never changes the result set.
+///
+/// The trace is deterministic and self-contained: no state is shared or
+/// reused between calls, so repeating a call — on any thread, after any
+/// other call, including a failed one — yields an identical trace.
+///
+/// # Examples
+///
+/// ```rust
+/// use fast_glob::{glob_match, glob_match_explain, FinalReason, TraceEvent};
+///
+/// let explanation = glob_match_explain("!**/secret/**", "src/secret/key.pem");
+/// assert_eq!(explanation.matched, glob_match("!**/secret/**", "src/secret/key.pem"));
+/// assert!(matches!(
+///     explanation.trace.last(),
+///     Some(TraceEvent::Final { matched: false, reason: FinalReason::NegatedExcluded })
+/// ));
+/// ```
+pub fn glob_match_explain(glob: impl AsRef<[u8]>, path: impl AsRef<[u8]>) -> Explanation {
+    let glob = glob.as_ref();
+    let path = path.as_ref();
+
+    let mut trace = Vec::new();
+    match validate(glob) {
+        Ok(()) => {
+            let negations = glob.iter().take_while(|&&b| b == b'!').count();
+            trace.push(TraceEvent::Compiled { negations });
+        }
+        Err(error) => {
+            trace.push(TraceEvent::CompileError { kind: error.kind, index: error.index });
+        }
+    }
+    trace.push(TraceEvent::Start { path_len: path.len() });
+
+    let outcome = glob_match_run(glob, path, &mut VecSink(&mut trace));
+
+    let reason = if outcome.invalid {
+        FinalReason::InvalidPattern
+    } else if outcome.negated {
+        if outcome.inner_matched {
+            FinalReason::NegatedExcluded
+        } else {
+            FinalReason::NegatedIncluded
+        }
+    } else if outcome.inner_matched {
+        FinalReason::FullMatch
+    } else {
+        FinalReason::NoMatch
+    };
+    trace.push(TraceEvent::Final { matched: outcome.matched, reason });
+
+    Explanation { matched: outcome.matched, trace }
+}
+
 /// Checks that `glob` is a valid pattern.
 ///
 /// [`glob_match`] has no way to report an invalid pattern, and its result for
@@ -225,6 +377,46 @@ pub fn validate(glob: impl AsRef<[u8]>) -> Result<(), Error> {
 /// pattern was detected as invalid, so tests can check the latter against
 /// [`validate`].
 fn glob_match_internal(glob: &[u8], path: &[u8]) -> (bool, bool) {
+    let outcome = glob_match_run(glob, path, &mut NoSink);
+    (outcome.matched, outcome.invalid)
+}
+
+/// Internal trace sink, generic so the default [`glob_match`] path
+/// monomorphizes [`NoSink`] into nothing: instrumentation is zero-cost
+/// unless [`glob_match_explain`] is used. Kept crate-private — it is an
+/// internal boundary serving the two public entry points, not a new API.
+trait Sink {
+    #[inline(always)]
+    fn event(&mut self, _event: TraceEvent) {}
+}
+
+struct NoSink;
+
+impl Sink for NoSink {}
+
+struct VecSink<'a>(&'a mut Vec<TraceEvent>);
+
+impl Sink for VecSink<'_> {
+    #[inline(always)]
+    fn event(&mut self, event: TraceEvent) {
+        self.0.push(event);
+    }
+}
+
+/// The outcome of a single matching run, before it is projected into the
+/// public shapes (`bool`, `(bool, bool)`, or [`Explanation`]).
+struct MatchOutcome {
+    /// The verdict [`glob_match`] would return.
+    matched: bool,
+    /// Whether the path matched the pattern before negation was applied.
+    inner_matched: bool,
+    /// Whether the pattern is negated an odd number of times.
+    negated: bool,
+    /// Whether the pattern was detected as invalid while matching.
+    invalid: bool,
+}
+
+fn glob_match_run(glob: &[u8], path: &[u8], sink: &mut impl Sink) -> MatchOutcome {
     let mut state = State::default();
 
     let mut negated = false;
@@ -236,18 +428,29 @@ fn glob_match_internal(glob: &[u8], path: &[u8]) -> (bool, bool) {
     let mut brace_stack = BraceStack::new();
     let mut invalid_pattern = false;
     let match_start = state.glob_index;
-    let matched =
-        state.glob_match_from(glob, path, match_start, &mut brace_stack, &mut invalid_pattern);
+    let matched = state.glob_match_from(
+        glob,
+        path,
+        match_start,
+        &mut brace_stack,
+        &mut invalid_pattern,
+        sink,
+    );
 
     // A negated glob matches every path its pattern does not — for an invalid
     // pattern that would be every path, even when the matcher never reaches
     // the invalid construct (e.g. after an early literal mismatch). Gate the
     // negation flip on validity instead of relying on lazy detection.
     if negated && !matched && !invalid_pattern && validate(glob).is_err() {
-        return (false, true);
+        return MatchOutcome { matched: false, inner_matched: false, negated, invalid: true };
     }
 
-    (negated ^ matched, invalid_pattern)
+    MatchOutcome {
+        matched: negated ^ matched,
+        inner_matched: matched,
+        negated,
+        invalid: invalid_pattern,
+    }
 }
 
 /// Returns the index just past the `]` closing the character class opened by
@@ -296,10 +499,14 @@ fn unescape(c: &mut u8, glob: &[u8], state: &mut State, invalid_pattern: &mut bo
 
 impl State {
     #[inline(always)]
-    fn backtrack(&mut self) {
+    fn backtrack<S: Sink>(&mut self, sink: &mut S) {
         self.glob_index = self.wildcard.glob_index as usize;
         self.path_index = self.wildcard.path_index as usize;
         self.brace_depth = self.wildcard.brace_depth as usize;
+        sink.event(TraceEvent::Backtrack {
+            glob_index: self.glob_index,
+            path_index: self.path_index,
+        });
     }
 
     #[inline(always)]
@@ -318,51 +525,59 @@ impl State {
     }
 
     #[inline(always)]
-    fn skip_to_separator(&mut self, path: &[u8], is_end_invalid: bool) {
+    fn skip_to_separator<S: Sink>(&mut self, path: &[u8], is_end_invalid: bool, sink: &mut S) {
+        let from = self.path_index;
         if self.path_index == path.len() {
             self.wildcard.path_index += 1;
-            return;
-        }
+        } else {
+            let mut path_index = self.path_index;
+            while path_index < path.len() && !is_separator(path[path_index] as char) {
+                path_index += 1;
+            }
 
-        let mut path_index = self.path_index;
-        while path_index < path.len() && !is_separator(path[path_index] as char) {
-            path_index += 1;
-        }
+            if is_end_invalid || path_index != path.len() {
+                path_index += 1;
+            }
 
-        if is_end_invalid || path_index != path.len() {
-            path_index += 1;
+            self.wildcard.path_index = path_index as u32;
+            self.globstar = self.wildcard;
         }
-
-        self.wildcard.path_index = path_index as u32;
-        self.globstar = self.wildcard;
+        sink.event(TraceEvent::SkipToSeparator {
+            from,
+            to: self.wildcard.path_index as usize,
+        });
     }
 
     #[inline(always)]
-    fn skip_branch(&mut self, glob: &[u8]) {
+    fn skip_branch<S: Sink>(&mut self, glob: &[u8], sink: &mut S) {
+        let from = self.glob_index;
         let end_brace_depth = self.brace_depth - 1;
-        while self.glob_index < glob.len() {
-            match glob[self.glob_index] {
-                b'{' => self.brace_depth += 1,
-                b'}' => {
-                    self.brace_depth -= 1;
-                    if self.brace_depth == end_brace_depth {
-                        self.glob_index += 1;
-                        return;
+        'skipped: {
+            while self.glob_index < glob.len() {
+                match glob[self.glob_index] {
+                    b'{' => self.brace_depth += 1,
+                    b'}' => {
+                        self.brace_depth -= 1;
+                        if self.brace_depth == end_brace_depth {
+                            self.glob_index += 1;
+                            break 'skipped;
+                        }
                     }
+                    b'[' => {
+                        // An unclosed class swallows the rest of the glob.
+                        self.glob_index = skip_class(glob, self.glob_index).unwrap_or(glob.len());
+                        continue;
+                    }
+                    b'\\' => self.glob_index += 1,
+                    _ => (),
                 }
-                b'[' => {
-                    // An unclosed class swallows the rest of the glob.
-                    self.glob_index = skip_class(glob, self.glob_index).unwrap_or(glob.len());
-                    continue;
-                }
-                b'\\' => self.glob_index += 1,
-                _ => (),
+                self.glob_index += 1;
             }
-            self.glob_index += 1;
         }
+        sink.event(TraceEvent::BraceSkip { from, to: self.glob_index });
     }
 
-    fn match_brace_branch(
+    fn match_brace_branch<S: Sink>(
         &self,
         glob: &[u8],
         path: &[u8],
@@ -370,6 +585,7 @@ impl State {
         branch_index: usize,
         brace_stack: &mut BraceStack,
         invalid_pattern: &mut bool,
+        sink: &mut S,
     ) -> bool {
         // Gracefully reject brace expansions deeper than BraceStack capacity.
         if brace_stack.try_push((open_brace_index as u32, branch_index as u32)).is_err() {
@@ -381,20 +597,27 @@ impl State {
         branch_state.glob_index = branch_index;
         branch_state.brace_depth = brace_stack.len();
 
-        let matched =
-            branch_state.glob_match_from(glob, path, branch_index, brace_stack, invalid_pattern);
+        let matched = branch_state.glob_match_from(
+            glob,
+            path,
+            branch_index,
+            brace_stack,
+            invalid_pattern,
+            sink,
+        );
 
         brace_stack.pop();
 
         matched
     }
 
-    fn match_brace(
+    fn match_brace<S: Sink>(
         &mut self,
         glob: &[u8],
         path: &[u8],
         brace_stack: &mut BraceStack,
         invalid_pattern: &mut bool,
+        sink: &mut S,
     ) -> bool {
         let mut brace_depth = 0;
         let mut has_closing_brace = false;
@@ -416,6 +639,10 @@ impl State {
                     brace_depth -= 1;
                     if brace_depth == 0 {
                         has_closing_brace = true;
+                        sink.event(TraceEvent::BraceBranch {
+                            open: open_brace_index,
+                            branch: branch_index,
+                        });
                         if self.match_brace_branch(
                             glob,
                             path,
@@ -423,6 +650,7 @@ impl State {
                             branch_index,
                             brace_stack,
                             invalid_pattern,
+                            sink,
                         ) {
                             matched = true;
                         }
@@ -430,6 +658,10 @@ impl State {
                     }
                 }
                 b',' if brace_depth == 1 => {
+                    sink.event(TraceEvent::BraceBranch {
+                        open: open_brace_index,
+                        branch: branch_index,
+                    });
                     if self.match_brace_branch(
                         glob,
                         path,
@@ -437,6 +669,7 @@ impl State {
                         branch_index,
                         brace_stack,
                         invalid_pattern,
+                        sink,
                     ) {
                         matched = true;
                     }
@@ -463,13 +696,14 @@ impl State {
     }
 
     #[inline(always)]
-    fn glob_match_from(
+    fn glob_match_from<S: Sink>(
         &mut self,
         glob: &[u8],
         path: &[u8],
         match_start: usize,
         brace_stack: &mut BraceStack,
         invalid_pattern: &mut bool,
+        sink: &mut S,
     ) -> bool {
         while self.glob_index < glob.len() || self.path_index < path.len() {
             if self.glob_index < glob.len() {
@@ -499,7 +733,7 @@ impl State {
                                     self.glob_index += 1;
                                 }
 
-                                self.skip_to_separator(path, is_end_invalid);
+                                self.skip_to_separator(path, is_end_invalid, sink);
                                 in_globstar = true;
                             }
                         } else {
@@ -512,6 +746,12 @@ impl State {
                         {
                             self.wildcard = self.globstar;
                         }
+
+                        sink.event(TraceEvent::Wildcard {
+                            globstar: in_globstar,
+                            glob_index: self.wildcard.glob_index as usize,
+                            path_index: self.wildcard.path_index as usize,
+                        });
 
                         continue;
                     }
@@ -591,10 +831,10 @@ impl State {
                             self.brace_depth += 1;
                             continue;
                         }
-                        return self.match_brace(glob, path, brace_stack, invalid_pattern);
+                        return self.match_brace(glob, path, brace_stack, invalid_pattern, sink);
                     }
                     b',' | b'}' if self.brace_depth > 0 => {
-                        self.skip_branch(glob);
+                        self.skip_branch(glob, sink);
                         continue;
                     }
                     mut c if self.path_index < path.len() => {
@@ -613,6 +853,10 @@ impl State {
                             self.path_index += 1;
 
                             if c == b'/' {
+                                sink.event(TraceEvent::Separator {
+                                    path_index: self.path_index - 1,
+                                    byte: path[self.path_index - 1],
+                                });
                                 self.wildcard = self.globstar;
                             }
 
@@ -624,10 +868,14 @@ impl State {
             }
 
             if self.wildcard.path_index > 0 && self.wildcard.path_index <= path.len() as u32 {
-                self.backtrack();
+                self.backtrack(sink);
                 continue;
             }
 
+            sink.event(TraceEvent::Pruned {
+                glob_index: self.glob_index,
+                path_index: self.path_index,
+            });
             return false;
         }
 
