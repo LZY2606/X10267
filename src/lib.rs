@@ -69,6 +69,8 @@
 use std::fmt;
 use std::path::is_separator;
 
+pub mod walk;
+
 use arrayvec::ArrayVec;
 
 const MAX_BRACE_NESTING: usize = 10;
@@ -255,7 +257,7 @@ fn glob_match_internal(glob: &[u8], path: &[u8]) -> (bool, bool) {
 /// parsing in `glob_match_from`: an optional `^`/`!` prefix, then the first
 /// character is a literal member (so a leading `]` does not close the class),
 /// and `\` escapes the next character.
-fn skip_class(glob: &[u8], index: usize) -> Option<usize> {
+pub(crate) fn skip_class(glob: &[u8], index: usize) -> Option<usize> {
     let mut index = index + 1;
     if matches!(glob.get(index), Some(b'^' | b'!')) {
         index += 1;
