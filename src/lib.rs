@@ -71,6 +71,13 @@ use std::path::is_separator;
 
 use arrayvec::ArrayVec;
 
+mod walk;
+
+pub use walk::{
+    glob_walk, glob_walk_explain, ExplainEvent, ExplainReport, FinalPath, IgnoreReason, PathKind,
+    PathSource, PermissionErrorPolicy, PruneReason, SymlinkAction, WalkError, WalkOptions,
+};
+
 const MAX_BRACE_NESTING: usize = 10;
 
 #[derive(Clone, Debug, Default)]
