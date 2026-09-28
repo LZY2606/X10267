@@ -67,11 +67,42 @@
  * https://github.com/devongovett/glob-match/tree/main/LICENSE
  */
 use std::fmt;
-use std::path::is_separator;
 
 use arrayvec::ArrayVec;
 
 const MAX_BRACE_NESTING: usize = 10;
+
+/// Options accepted by [`glob_match_with_options`].
+///
+/// The zero-cost `Default` (`case_insensitive == false`,
+/// `backslash_is_separator == false`) is exactly the platform behavior of
+/// [`glob_match`]: on Unix only `/` separates path segments and backslash is
+/// never a separator; enabling `backslash_is_separator` additionally treats
+/// `\` as a separator (the platform convention on Windows).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MatchOptions {
+    /// Fold ASCII case in path literals while matching (`[a-z]` against `A`).
+    pub case_insensitive: bool,
+    /// Treat a backslash in the *path* as a path separator. Backslash in the
+    /// pattern remains an escape character.
+    pub backslash_is_separator: bool,
+}
+
+#[inline(always)]
+fn is_path_separator(byte: u8, backslash_is_separator: bool) -> bool {
+    byte == b'/'
+        || (cfg!(windows) && byte == b'\\')
+        || (backslash_is_separator && byte == b'\\')
+}
+
+#[inline(always)]
+fn fold_byte(byte: u8, case_insensitive: bool) -> u8 {
+    if case_insensitive {
+        byte.to_ascii_lowercase()
+    } else {
+        byte
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 struct State {
